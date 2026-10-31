@@ -32,6 +32,7 @@ SEARCH_DIRS = [APP_DIR / "data", APP_DIR]  # 엑셀 파일을 찾는 폴더 (dat
 
 AMOUNT = "금액"
 GROWTH = "전년 대비 증가율"
+INDEX = "지수(기준연도=100)"
 ALL_LABEL = "전체(합계)"
 MEDIA = ["PC", "모바일", "합계"]
 INCLUDE = "포함"
@@ -215,6 +216,28 @@ def prepare(df: pd.DataFrame, mode: str, include_estimates: bool, year_range: tu
     return out[(out["year"] >= low) & (out["year"] <= high)].reset_index(drop=True)
 
 
+def to_index(ad: pd.DataFrame, shops: dict[str, pd.DataFrame]):
+    """금액 → 지수(기준연도=100). 그려질 모든 선이 값을 가진 가장 이른 해를 기준연도로 삼아,
+    모든 선이 같은 해에 100에서 출발하게 한다. (금액이 달라도 '몇 배로 늘었는지'를 같은 축에서 비교)
+    돌려주는 값: (광고 표, {이름: 쇼핑 표}, 기준연도)"""
+    frames = [df for df in [ad, *shops.values()] if not df.empty]
+    if not frames:
+        return ad, shops, None
+    base_year = max(int(df["year"].min()) for df in frames)
+
+    def rebase(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+        base = df.loc[df["year"] == base_year, "value"]
+        if base.empty or base.iloc[0] == 0:
+            return df.iloc[0:0]
+        out = df[df["year"] >= base_year].copy()
+        out["value"] = out["value"] / base.iloc[0] * 100
+        return out.reset_index(drop=True)
+
+    return rebase(ad), {name: rebase(df) for name, df in shops.items()}, base_year
+
+
 def correlation(a: pd.DataFrame, b: pd.DataFrame) -> tuple[float, int]:
     """두 연도별 표의 피어슨 상관계수와 겹치는 연도 수. 연도가 3개 미만이면 계산하지 않는다."""
     merged = a[["year", "value"]].merge(b[["year", "value"]], on="year", suffixes=("_a", "_b")).dropna()
@@ -260,10 +283,10 @@ def _add_line(fig, df: pd.DataFrame, name: str, color: str, unit: str, dual: boo
 
 def make_figure(ad_label: str, ad_series: pd.DataFrame, shop_series: dict[str, pd.DataFrame], mode: str):
     """금액 기준이면 왼쪽 축=광고 매출액, 오른쪽 축=모바일 쇼핑 거래액(이중축).
-    증가율 기준이면 단위가 같은 %이므로 축 하나에 겹쳐 그린다."""
+    증가율·지수 기준이면 단위가 같으므로 축 하나에 겹쳐 그린다."""
     dual = mode == AMOUNT and len(shop_series) > 0
     fig = make_subplots(specs=[[{"secondary_y": True}]]) if dual else go.Figure()
-    unit = " 조 원" if mode == AMOUNT else "%"
+    unit = {AMOUNT: " 조 원", GROWTH: "%", INDEX: ""}[mode]
 
     if not ad_series.empty:
         _add_line(fig, ad_series, ad_label, AD_COLOR, unit, dual, right_axis=False)
@@ -278,6 +301,9 @@ def make_figure(ad_label: str, ad_series: pd.DataFrame, shop_series: dict[str, p
         fig.update_yaxes(title_text="모바일 쇼핑 거래액 (조 원)", rangemode="tozero", showgrid=False, secondary_y=True)
     elif mode == AMOUNT:
         fig.update_yaxes(title_text="디지털 광고 매출액 (조 원)", rangemode="tozero")
+    elif mode == INDEX:
+        fig.update_yaxes(title_text="지수 (기준연도 = 100)")
+        fig.add_hline(y=100, line_width=1, line_dash="dot", opacity=0.5)
     else:
         fig.update_yaxes(title_text="전년 대비 증가율 (%)")
         fig.add_hline(y=0, line_width=1, line_dash="dot", opacity=0.5)
@@ -347,7 +373,12 @@ def main() -> None:
             "상품군 (모바일 쇼핑 거래액)", options=categories, default=[ALL_LABEL],
             help="여러 개를 고르면 상품군마다 선이 하나씩 그려집니다.",
         )
-        mode = st.radio("값 기준", [AMOUNT, GROWTH], help="증가율은 바로 앞 연도 대비 증감률(%)입니다.")
+        mode = st.radio(
+            "값 기준", [AMOUNT, GROWTH, INDEX],
+            help="금액: 광고(왼쪽 축)와 쇼핑(오른쪽 축)의 눈금이 따로입니다. "
+                 "증가율: 바로 앞 연도 대비 증감률(%)입니다. "
+                 "지수: 기준연도(선택 범위에서 모든 선이 값을 가진 첫 해)를 100으로 맞춰 같은 축에서 비교합니다.",
+        )
         estimate_choice = st.radio(
             "예측값(추정치)", [EXCLUDE, INCLUDE], horizontal=True,
             help="광고비의 추정치(e)와 쇼핑 거래액의 잠정치(p)를 그래프에 넣을지 정합니다.",
@@ -368,7 +399,12 @@ def main() -> None:
         }
         return ad, shops
 
-    ad_series, shop_series = series_for(mode)
+    base_year = None
+    if mode == INDEX:
+        ad_amount_raw, shop_amount_raw = series_for(AMOUNT)
+        ad_series, shop_series, base_year = to_index(ad_amount_raw, shop_amount_raw)
+    else:
+        ad_series, shop_series = series_for(mode)
 
     if not chosen:
         st.info("사이드바에서 상품군을 고르면 모바일 쇼핑 거래액이 함께 그려집니다. 지금은 광고 매출액만 보입니다.")
@@ -380,6 +416,11 @@ def main() -> None:
 
     if mode == AMOUNT and shop_series:
         st.caption("※ 왼쪽 축(광고)과 오른쪽 축(쇼핑)의 눈금이 다릅니다. 선의 높이를 서로 비교하지 말고 변화하는 모양을 보세요.")
+    if mode == INDEX and base_year is not None:
+        st.caption(
+            f"※ {base_year}년을 100으로 맞춘 지수입니다. 예를 들어 200이면 {base_year}년의 2배라는 뜻이며, "
+            "금액이 아니라 증가한 배수를 비교합니다. 기준연도를 바꾸면(연도 범위를 바꾸면) 선의 위치가 달라집니다."
+        )
     notes = []
     if not include_estimates and estimate_ad_years:
         notes.append(f"광고비 {', '.join(map(str, estimate_ad_years))}년은 추정치라 '미포함'에서는 표시되지 않습니다.")
@@ -427,4 +468,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-  
