@@ -37,6 +37,8 @@ ALL_LABEL = "전체(합계)"
 MEDIA = ["PC", "모바일", "합계"]
 INCLUDE = "포함"
 EXCLUDE = "미포함"
+ESTIMATE_KEY = "estimate_choice"  # 예측값 라디오의 session_state 이름 (슬라이더 범위를 먼저 정하려고 사용)
+CORR_COLUMNS = [f"{kind}·{medium}" for kind in ("금액", "증가율") for medium in MEDIA]
 
 AD_COLOR = "#2563eb"
 SHOP_COLORS = [
@@ -329,6 +331,45 @@ def build_value_table(ad_label: str, ad_series: pd.DataFrame, shop_series: dict[
     return table
 
 
+def correlation_matrix(ad_tables, shop, categories, include_estimates, year_range):
+    """상품군 × (값 기준 2가지 × 광고 매체 3가지) 상관계수 표와 연도 수 표를 만든다.
+    행은 '증가율·합계' 상관계수가 큰 순서로 정렬한다. (금액 상관은 공통 추세로 거의 다 높아 구분이 안 되기 때문)"""
+    corr = pd.DataFrame(float("nan"), index=categories, columns=CORR_COLUMNS)
+    nobs = pd.DataFrame(0, index=categories, columns=CORR_COLUMNS)
+    for chart_mode, kind in ((AMOUNT, "금액"), (GROWTH, "증가율")):
+        ads = {m: prepare(ad_tables[m], chart_mode, include_estimates, year_range) for m in MEDIA}
+        for category in categories:
+            sales = prepare(
+                shop[shop["category"] == category][["year", "value", "estimate"]],
+                chart_mode, include_estimates, year_range,
+            )
+            for m in MEDIA:
+                r, n = correlation(ads[m], sales)
+                corr.loc[category, f"{kind}·{m}"] = r
+                nobs.loc[category, f"{kind}·{m}"] = n
+    order = corr["증가율·합계"].sort_values(ascending=False, na_position="last").index
+    return corr.loc[order], nobs.loc[order]
+
+
+def make_corr_heatmap(corr: pd.DataFrame, nobs: pd.DataFrame):
+    """상관계수 히트맵. 색(파랑=양, 빨강=음)과 숫자를 함께 보여 주고, 마우스를 올리면 연도 수를 보여 준다."""
+    z = corr.to_numpy(dtype=float)
+    text = [["–" if pd.isna(v) else f"{v:.2f}" for v in row] for row in z]
+    fig = go.Figure(
+        go.Heatmap(
+            z=z, x=list(corr.columns), y=list(corr.index),
+            text=text, texttemplate="%{text}", customdata=nobs.to_numpy(),
+            zmin=-1, zmax=1, colorscale="RdBu", xgap=2, ygap=2, hoverongaps=False,
+            colorbar=dict(title="상관계수"),
+            hovertemplate="%{y}<br>%{x}<br>상관계수 %{z:.2f} · 연도 %{customdata}개<extra></extra>",
+        )
+    )
+    fig.update_xaxes(side="top")
+    fig.update_yaxes(autorange="reversed")
+    fig.update_layout(height=max(220, 80 + 30 * len(corr)), margin=dict(l=10, r=10, t=10, b=10))
+    return fig
+
+
 # ──────────────────────────────────────────────────────────────
 # 화면 구성
 # ──────────────────────────────────────────────────────────────
@@ -356,18 +397,26 @@ def main() -> None:
     ad_tables = build_ad_tables(pc, mobile)
 
     all_years = list(ad_tables["합계"]["year"]) + list(shop["year"])
-    year_min, year_max = int(min(all_years)), int(max(all_years))
+    year_min, year_max_all = int(min(all_years)), int(max(all_years))
+    # 예측값 '미포함'일 때 고를 수 있는 마지막 해 = 광고비 실측값이 있는 마지막 해
+    year_max_actual = int(ad_tables["합계"].loc[~ad_tables["합계"]["estimate"], "year"].max())
     estimate_ad_years = sorted(int(y) for y in ad_tables["합계"].loc[ad_tables["합계"]["estimate"], "year"])
     estimate_shop_years = sorted(int(y) for y in shop.loc[shop["estimate"], "year"].unique())
 
     # ── 2) 사이드바 ──
     with st.sidebar:
         st.header("분석 조건")
+        # 아래쪽 '예측값' 라디오의 현재 선택을 session_state에서 미리 읽어, 슬라이더의 마지막 연도를 정한다.
+        # ('포함'을 누르면 슬라이더가 2026년까지 늘어나고, 범위가 2018~2026으로 다시 잡힌다.)
+        include_now = st.session_state.get(ESTIMATE_KEY, EXCLUDE) == INCLUDE
+        year_max = year_max_all if include_now else year_max_actual
         year_range = st.slider(
             "연도 범위",
             min_value=year_min, max_value=year_max,
-            value=(max(year_min, 2018), min(year_max, 2024)), step=1,
+            value=(max(year_min, 2018), year_max), step=1,
         )
+        if year_max_actual != year_max_all:
+            st.caption(f"예측값 '미포함'은 {year_max_actual}년까지, '포함'은 {year_max_all}년까지 고를 수 있습니다.")
         medium = st.radio("광고 매체", MEDIA, index=2, help="합계는 PC 광고비와 모바일 광고비를 더한 값입니다.")
         chosen = st.multiselect(
             "상품군 (모바일 쇼핑 거래액)", options=categories, default=[ALL_LABEL],
@@ -380,8 +429,9 @@ def main() -> None:
                  "지수: 기준연도(선택 범위에서 모든 선이 값을 가진 첫 해)를 100으로 맞춰 같은 축에서 비교합니다.",
         )
         estimate_choice = st.radio(
-            "예측값(추정치)", [EXCLUDE, INCLUDE], horizontal=True,
-            help="광고비의 추정치(e)와 쇼핑 거래액의 잠정치(p)를 그래프에 넣을지 정합니다.",
+            "예측값(추정치)", [EXCLUDE, INCLUDE], horizontal=True, key=ESTIMATE_KEY,
+            help="광고비의 추정치(e)와 쇼핑 거래액의 잠정치(p)를 그래프에 넣을지 정합니다. "
+                 "'포함'을 고르면 연도 범위를 추정치가 있는 마지막 해까지 늘릴 수 있습니다.",
         )
     include_estimates = estimate_choice == INCLUDE
 
@@ -423,7 +473,10 @@ def main() -> None:
         )
     notes = []
     if not include_estimates and estimate_ad_years:
-        notes.append(f"광고비 {', '.join(map(str, estimate_ad_years))}년은 추정치라 '미포함'에서는 표시되지 않습니다.")
+        notes.append(
+            f"광고비 {', '.join(map(str, estimate_ad_years))}년은 추정치라 '미포함'에서는 표시되지 않습니다. "
+            f"예측값을 '포함'으로 바꾸면 연도 범위를 {year_max_all}년까지 늘릴 수 있습니다."
+        )
     if include_estimates and (estimate_ad_years or estimate_shop_years):
         notes.append("점선과 속이 빈 점은 추정치(광고비) 또는 잠정치(쇼핑 거래액)입니다.")
     if skipped_years:
@@ -432,29 +485,31 @@ def main() -> None:
     for note in notes:
         st.caption("※ " + note)
 
-    # ── 상관계수 (결론 확인용) ──
-    if chosen:
-        st.subheader("광고 매출액과의 상관계수")
-        ad_amount, shop_amount = series_for(AMOUNT)
-        ad_growth, shop_growth = series_for(GROWTH)
-        rows = []
-        for category in chosen:
-            label = shop_label(category)
-            r_amount, n_amount = correlation(ad_amount, shop_amount[label])
-            r_growth, n_growth = correlation(ad_growth, shop_growth[label])
-            rows.append({
-                "상품군": category,
-                "금액 상관계수": f"{r_amount:.2f}" if pd.notna(r_amount) else "계산 불가",
-                "금액 연도 수": n_amount,
-                "증가율 상관계수": f"{r_growth:.2f}" if pd.notna(r_growth) else "계산 불가",
-                "증가율 연도 수": n_growth,
-            })
-        st.dataframe(pd.DataFrame(rows), hide_index=True)
+    # ── 상관계수 히트맵 (결론 확인용) ──
+    st.subheader("광고 매출액과 모바일 쇼핑 거래액의 상관계수")
+    show_all = st.checkbox(
+        "모든 상품군 보기", value=False,
+        help="끄면 사이드바에서 고른 상품군만, 켜면 모든 상품군을 보여 줍니다. (위 그래프에는 영향이 없습니다)",
+    )
+    corr_categories = categories if show_all else chosen
+    if corr_categories:
+        corr, nobs = correlation_matrix(ad_tables, shop, corr_categories, include_estimates, year_range)
+        st.plotly_chart(make_corr_heatmap(corr, nobs))
         st.caption(
-            "※ 두 값이 모두 해마다 늘어난 추세라서 금액의 상관계수는 높게 나오기 쉽습니다. "
-            "연도 수가 적어 값이 불안정하며, 상관관계가 있어도 광고가 거래액을 늘렸다는 뜻은 아닙니다(상관과 인과는 다릅니다). "
-            "연도 수가 3개 미만이면 계산하지 않습니다."
+            "※ 파란색은 함께 늘어난 관계(양의 상관), 빨간색은 반대로 움직인 관계(음의 상관), 흰색에 가까울수록 관계가 약합니다. "
+            "열은 값 기준(금액·증가율) × 광고 매체(PC·모바일·합계)이며, 사이드바의 연도 범위와 예측값 선택이 적용됩니다. "
+            "행은 '증가율·합계' 값이 큰 순서입니다."
         )
+        st.caption(
+            "※ 두 값이 모두 해마다 늘어난 추세라서 금액 열은 거의 다 진한 파란색으로 나오기 쉽습니다. 증가율 열과 함께 보세요. "
+            "연도 수가 적어 값이 불안정하며(마우스를 올리면 연도 수가 보입니다), 상관관계가 있어도 광고가 거래액을 늘렸다는 뜻은 아닙니다(상관과 인과는 다릅니다). "
+            "연도가 3개 미만이면 계산하지 않고 '–'로 표시합니다."
+        )
+        with st.expander("상관계수와 연도 수를 표로 보기"):
+            st.dataframe(corr.round(2))
+            st.dataframe(nobs)
+    else:
+        st.info("사이드바에서 상품군을 고르거나 '모든 상품군 보기'를 켜면 상관계수 히트맵이 나타납니다.")
 
     # ── 그래프에 쓰인 값 ──
     with st.expander("그래프에 쓰인 값 보기 / 내려받기"):
