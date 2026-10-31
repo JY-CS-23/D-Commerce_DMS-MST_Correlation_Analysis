@@ -40,7 +40,9 @@ EXCLUDE = "미포함"
 ESTIMATE_KEY = "estimate_choice"  # 예측값 라디오의 session_state 이름 (슬라이더 범위를 먼저 정하려고 사용)
 CORR_COLUMNS = [f"{kind}·{medium}" for kind in ("금액", "증가율") for medium in MEDIA]
 
-AD_COLOR = "#2563eb"
+MEDIA_BOTH = "PC·모바일 각각"  # PC 선과 모바일 선을 동시에 그리는 선택지 (합계와는 다름)
+MEDIA_CHOICES = MEDIA + [MEDIA_BOTH]
+AD_COLORS = {"PC": "#7aa7ff", "모바일": "#2548c9", "합계": "#2563eb"}
 SHOP_COLORS = [
     "#d95f02", "#1b9e77", "#7570b3", "#e7298a",
     "#66a61e", "#e6ab02", "#a6761d", "#555555",
@@ -218,13 +220,18 @@ def prepare(df: pd.DataFrame, mode: str, include_estimates: bool, year_range: tu
     return out[(out["year"] >= low) & (out["year"] <= high)].reset_index(drop=True)
 
 
-def to_index(ad: pd.DataFrame, shops: dict[str, pd.DataFrame]):
+def ad_label(medium: str) -> str:
+    """광고 매체 이름 → 그래프에 쓰는 선 이름"""
+    return "디지털 광고 매출액 (PC+모바일)" if medium == "합계" else f"디지털 광고 매출액 ({medium})"
+
+
+def to_index(ads: dict[str, pd.DataFrame], shops: dict[str, pd.DataFrame]):
     """금액 → 지수(기준연도=100). 그려질 모든 선이 값을 가진 가장 이른 해를 기준연도로 삼아,
     모든 선이 같은 해에 100에서 출발하게 한다. (금액이 달라도 '몇 배로 늘었는지'를 같은 축에서 비교)
-    돌려주는 값: (광고 표, {이름: 쇼핑 표}, 기준연도)"""
-    frames = [df for df in [ad, *shops.values()] if not df.empty]
+    돌려주는 값: ({매체: 광고 표}, {이름: 쇼핑 표}, 기준연도)"""
+    frames = [df for df in [*ads.values(), *shops.values()] if not df.empty]
     if not frames:
-        return ad, shops, None
+        return ads, shops, None
     base_year = max(int(df["year"].min()) for df in frames)
 
     def rebase(df: pd.DataFrame) -> pd.DataFrame:
@@ -237,7 +244,11 @@ def to_index(ad: pd.DataFrame, shops: dict[str, pd.DataFrame]):
         out["value"] = out["value"] / base.iloc[0] * 100
         return out.reset_index(drop=True)
 
-    return rebase(ad), {name: rebase(df) for name, df in shops.items()}, base_year
+    return (
+        {medium: rebase(df) for medium, df in ads.items()},
+        {name: rebase(df) for name, df in shops.items()},
+        base_year,
+    )
 
 
 def correlation(a: pd.DataFrame, b: pd.DataFrame) -> tuple[float, int]:
@@ -283,15 +294,17 @@ def _add_line(fig, df: pd.DataFrame, name: str, color: str, unit: str, dual: boo
         )
 
 
-def make_figure(ad_label: str, ad_series: pd.DataFrame, shop_series: dict[str, pd.DataFrame], mode: str):
-    """금액 기준이면 왼쪽 축=광고 매출액, 오른쪽 축=모바일 쇼핑 거래액(이중축).
-    증가율·지수 기준이면 단위가 같으므로 축 하나에 겹쳐 그린다."""
+def make_figure(ad_series: dict[str, pd.DataFrame], shop_series: dict[str, pd.DataFrame], mode: str):
+    """금액 기준이면 왼쪽 축=광고 매출액(선택한 매체 모두), 오른쪽 축=모바일 쇼핑 거래액(이중축).
+    증가율·지수 기준이면 단위가 같으므로 축 하나에 겹쳐 그린다.
+    ad_series는 {매체 이름: 연도별 표}이며 'PC·모바일 각각'이면 두 매체가 같은 왼쪽 축에 함께 그려진다."""
     dual = mode == AMOUNT and len(shop_series) > 0
     fig = make_subplots(specs=[[{"secondary_y": True}]]) if dual else go.Figure()
     unit = {AMOUNT: " 조 원", GROWTH: "%", INDEX: ""}[mode]
 
-    if not ad_series.empty:
-        _add_line(fig, ad_series, ad_label, AD_COLOR, unit, dual, right_axis=False)
+    for medium, df in ad_series.items():
+        if not df.empty:
+            _add_line(fig, df, ad_label(medium), AD_COLORS[medium], unit, dual, right_axis=False)
     for i, (name, df) in enumerate(shop_series.items()):
         if not df.empty:
             _add_line(fig, df, name, SHOP_COLORS[i % len(SHOP_COLORS)], unit, dual, right_axis=True)
@@ -318,11 +331,12 @@ def make_figure(ad_label: str, ad_series: pd.DataFrame, shop_series: dict[str, p
     return fig
 
 
-def build_value_table(ad_label: str, ad_series: pd.DataFrame, shop_series: dict[str, pd.DataFrame]) -> pd.DataFrame:
+def build_value_table(ad_series: dict[str, pd.DataFrame], shop_series: dict[str, pd.DataFrame]) -> pd.DataFrame:
     """그래프에 쓰인 값을 연도 × 계열 표로 만든다 (원본 엑셀과 대조할 때 사용)."""
     columns = {}
-    if not ad_series.empty:
-        columns[ad_label] = ad_series.set_index("year")["value"]
+    for medium, df in ad_series.items():
+        if not df.empty:
+            columns[ad_label(medium)] = df.set_index("year")["value"]
     for name, df in shop_series.items():
         if not df.empty:
             columns[name] = df.set_index("year")["value"]
@@ -417,7 +431,11 @@ def main() -> None:
         )
         if year_max_actual != year_max_all:
             st.caption(f"예측값 '미포함'은 {year_max_actual}년까지, '포함'은 {year_max_all}년까지 고를 수 있습니다.")
-        medium = st.radio("광고 매체", MEDIA, index=2, help="합계는 PC 광고비와 모바일 광고비를 더한 값입니다.")
+        medium = st.radio(
+            "광고 매체", MEDIA_CHOICES, index=2,
+            help="합계: PC 광고비와 모바일 광고비를 더한 선 1개. "
+                 "PC·모바일 각각: PC 선과 모바일 선을 따로 동시에 그립니다.",
+        )
         chosen = st.multiselect(
             "상품군 (모바일 쇼핑 거래액)", options=categories, default=[ALL_LABEL],
             help="여러 개를 고르면 상품군마다 선이 하나씩 그려집니다.",
@@ -436,18 +454,18 @@ def main() -> None:
     include_estimates = estimate_choice == INCLUDE
 
     # ── 3) 값 준비와 차트 ──
-    ad_label = "디지털 광고 매출액 (PC+모바일)" if medium == "합계" else f"디지털 광고 매출액 ({medium})"
+    shown_media = ["PC", "모바일"] if medium == MEDIA_BOTH else [medium]
 
     def shop_label(category: str) -> str:
         return f"모바일 쇼핑 거래액 · {category}"
 
     def series_for(chart_mode: str):
-        ad = prepare(ad_tables[medium], chart_mode, include_estimates, year_range)
+        ads = {m: prepare(ad_tables[m], chart_mode, include_estimates, year_range) for m in shown_media}
         shops = {
             shop_label(c): prepare(shop[shop["category"] == c][["year", "value", "estimate"]], chart_mode, include_estimates, year_range)
             for c in chosen
         }
-        return ad, shops
+        return ads, shops
 
     base_year = None
     if mode == INDEX:
@@ -458,11 +476,11 @@ def main() -> None:
 
     if not chosen:
         st.info("사이드바에서 상품군을 고르면 모바일 쇼핑 거래액이 함께 그려집니다. 지금은 광고 매출액만 보입니다.")
-    if ad_series.empty and all(df.empty for df in shop_series.values()):
+    if all(df.empty for df in ad_series.values()) and all(df.empty for df in shop_series.values()):
         st.warning("선택한 조건에 해당하는 데이터가 없습니다. 연도 범위를 넓히거나 예측값을 '포함'으로 바꿔 보세요.")
         st.stop()
 
-    st.plotly_chart(make_figure(ad_label, ad_series, shop_series, mode))
+    st.plotly_chart(make_figure(ad_series, shop_series, mode))
 
     if mode == AMOUNT and shop_series:
         st.caption("※ 왼쪽 축(광고)과 오른쪽 축(쇼핑)의 눈금이 다릅니다. 선의 높이를 서로 비교하지 말고 변화하는 모양을 보세요.")
@@ -513,7 +531,7 @@ def main() -> None:
 
     # ── 그래프에 쓰인 값 ──
     with st.expander("그래프에 쓰인 값 보기 / 내려받기"):
-        table = build_value_table(ad_label, ad_series, shop_series)
+        table = build_value_table(ad_series, shop_series)
         st.dataframe(table.round(3))
         st.download_button(
             "CSV로 내려받기", data=table.to_csv().encode("utf-8-sig"),
