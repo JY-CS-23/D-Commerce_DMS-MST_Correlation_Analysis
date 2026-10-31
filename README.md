@@ -1,5 +1,3 @@
-# D-Commerce_DMS-MST_Correlation_Analysis
-Digital Marketing Stimuli - Mobile Shopping Transaction Amount Correlation Analysis
 # 디지털 광고 매출액과 모바일 쇼핑 거래액
 
 디지털 광고 매출액(PC·모바일)과 모바일 쇼핑 거래액이 연도별로 어떻게 함께 변했는지 한 그래프에서 보여 주는 Streamlit 웹앱입니다.
