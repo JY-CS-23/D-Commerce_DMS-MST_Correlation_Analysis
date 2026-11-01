@@ -19,6 +19,7 @@ import unicodedata
 import warnings
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -33,6 +34,7 @@ SEARCH_DIRS = [APP_DIR / "data", APP_DIR]  # 엑셀 파일을 찾는 폴더 (dat
 AMOUNT = "금액"
 GROWTH = "전년 대비 증가율"
 INDEX = "지수(기준연도=100)"
+INCREASE = "증가액"  # 전년 대비 증가액(조 원). 사이드바 선택지는 아니고 '광고비 추이' 탭에서만 쓴다.
 ALL_LABEL = "전체(합계)"
 MEDIA = ["PC", "모바일", "합계"]
 INCLUDE = "포함"
@@ -196,18 +198,28 @@ def build_ad_tables(pc: pd.DataFrame, mobile: pd.DataFrame) -> dict[str, pd.Data
 # ──────────────────────────────────────────────────────────────
 # 계산 도우미
 # ──────────────────────────────────────────────────────────────
-def to_yoy(df: pd.DataFrame) -> pd.DataFrame:
-    """연도별 값 → 전년 대비 증가율(%). 바로 앞 연도가 있는 해만 계산한다."""
+def _yearly_change(df: pd.DataFrame, kind: str) -> pd.DataFrame:
+    """바로 앞 연도가 있는 해만 전년 대비 변화를 계산한다. kind='pct'면 증가율(%), 'diff'면 증가액."""
     if df.empty:
         return df.copy()
     values = df.set_index("year")["value"]
     flags = df.set_index("year")["estimate"]
     years = range(int(values.index.min()), int(values.index.max()) + 1)
     full = values.reindex(years)
-    growth = (full / full.shift(1) - 1) * 100
+    change = (full / full.shift(1) - 1) * 100 if kind == "pct" else full - full.shift(1)
     est = flags.reindex(years, fill_value=False).astype(bool)
-    out = pd.DataFrame({"year": list(years), "value": growth.to_numpy(), "estimate": est.to_numpy()})
+    out = pd.DataFrame({"year": list(years), "value": change.to_numpy(), "estimate": est.to_numpy()})
     return out.dropna(subset=["value"]).reset_index(drop=True)
+
+
+def to_yoy(df: pd.DataFrame) -> pd.DataFrame:
+    """연도별 값 → 전년 대비 증가율(%). 바로 앞 연도가 있는 해만 계산한다."""
+    return _yearly_change(df, "pct")
+
+
+def to_diff(df: pd.DataFrame) -> pd.DataFrame:
+    """연도별 값 → 전년 대비 증가액(원래 단위, 조 원). 바로 앞 연도가 있는 해만 계산한다."""
+    return _yearly_change(df, "diff")
 
 
 def prepare(df: pd.DataFrame, mode: str, include_estimates: bool, year_range: tuple[int, int]) -> pd.DataFrame:
@@ -216,6 +228,8 @@ def prepare(df: pd.DataFrame, mode: str, include_estimates: bool, year_range: tu
     out = df if include_estimates else df[~df["estimate"]]
     if mode == GROWTH:
         out = to_yoy(out)
+    elif mode == INCREASE:
+        out = to_diff(out)
     low, high = year_range
     return out[(out["year"] >= low) & (out["year"] <= high)].reset_index(drop=True)
 
@@ -343,6 +357,193 @@ def build_value_table(ad_series: dict[str, pd.DataFrame], shop_series: dict[str,
     table = pd.DataFrame(columns)
     table.index.name = "연도"
     return table
+
+
+# ──────────────────────────────────────────────────────────────
+# 분석 탭용 계산·차트 (추세선 / 산점도 / 품목별 연평균 증가율 / 흩어진 정도·극값)
+# ──────────────────────────────────────────────────────────────
+def fit_line(x, y):
+    """최소제곱 직선 y = 기울기·x + 절편 → (기울기, 절편). 점이 3개 미만이거나 x가 모두 같으면 None."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    ok = ~(np.isnan(x) | np.isnan(y))
+    x, y = x[ok], y[ok]
+    if len(x) < 3 or np.ptp(x) == 0:
+        return None
+    slope, intercept = np.polyfit(x, y, 1)
+    return float(slope), float(intercept)
+
+
+def _add_fit(fig, x, y, name: str) -> None:
+    """점들에 맞춘 직선(추세선)을 점선으로 덧그린다."""
+    fit = fit_line(x, y)
+    if fit is None:
+        return
+    slope, intercept = fit
+    xs = [float(min(x)), float(max(x))]
+    fig.add_trace(
+        go.Scatter(
+            x=xs, y=[slope * v + intercept for v in xs], mode="lines", name=name,
+            line=dict(color="#6b7280", width=2, dash="dot"),
+            hovertemplate=f"{name}<br>기울기 {slope:+.3f}<extra></extra>",
+        )
+    )
+
+
+def make_trend_figures(total: pd.DataFrame, increase: pd.DataFrame):
+    """광고비 추이 탭: 왼쪽 = 연도별 광고비 합계 꺾은선 + 추세선, 오른쪽 = 연도별 증가액 막대 + 추세선."""
+    legend = dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
+    margin = dict(l=10, r=10, t=50, b=10)
+
+    line = go.Figure()
+    _add_line(line, total, "디지털 광고 매출액 (PC+모바일)", AD_COLORS["합계"], " 조 원", False, False)
+    _add_fit(line, total["year"], total["value"], "추세선")
+    line.update_xaxes(title_text="연도", dtick=1, tickformat="d")
+    line.update_yaxes(title_text="조 원", rangemode="tozero")
+    line.update_layout(height=380, margin=margin, legend=legend)
+
+    bar = go.Figure()
+    if not increase.empty:
+        bar.add_trace(
+            go.Bar(
+                x=increase["year"], y=increase["value"], name="전년 대비 증가액",
+                marker=dict(color=AD_COLORS["합계"], opacity=[0.45 if e else 1.0 for e in increase["estimate"]]),
+                hovertemplate="%{x}년 · %{y:+,.2f} 조 원<extra></extra>",
+            )
+        )
+        _add_fit(bar, increase["year"], increase["value"], "증가액 추세선")
+    bar.update_xaxes(title_text="연도", dtick=1, tickformat="d")
+    bar.update_yaxes(title_text="조 원")
+    bar.update_layout(height=380, margin=margin, legend=legend)
+    return line, bar
+
+
+def make_scatter(ad_df: pd.DataFrame, shops: dict[str, pd.DataFrame], mode: str, ad_name: str):
+    """산점도: x = 디지털 광고비, y = 모바일 쇼핑 거래액(상품군마다 한 묶음). 점 옆에 연도를 적고 직선을 덧그린다.
+    돌려주는 값: (그림, [상관계수·직선 기울기·연도 수 표의 행])"""
+    unit = " 조 원" if mode == AMOUNT else "%"
+    fig = go.Figure()
+    rows = []
+    for i, (name, df) in enumerate(shops.items()):
+        merged = ad_df[["year", "value"]].merge(df[["year", "value"]], on="year", suffixes=("_x", "_y")).dropna()
+        color = SHOP_COLORS[i % len(SHOP_COLORS)]
+        r, n = correlation(ad_df, df)
+        fit = fit_line(merged["value_x"], merged["value_y"])
+        rows.append({
+            "계열": name, "상관계수": r, "직선 기울기": fit[0] if fit else float("nan"), "연도 수": n,
+        })
+        legend_name = f"{name} (r={r:.2f}, 연도 {n}개)" if pd.notna(r) else f"{name} (연도 {n}개)"
+        fig.add_trace(
+            go.Scatter(
+                x=merged["value_x"], y=merged["value_y"], mode="markers+text",
+                text=merged["year"].astype(str), textposition="top center",
+                name=legend_name, legendgroup=name,
+                marker=dict(size=10, color=color),
+                hovertemplate=f"<b>{name}</b><br>%{{text}}년<br>광고 %{{x:,.2f}}{unit} · 쇼핑 %{{y:,.2f}}{unit}<extra></extra>",
+            )
+        )
+        if fit:
+            xs = [float(merged["value_x"].min()), float(merged["value_x"].max())]
+            fig.add_trace(
+                go.Scatter(
+                    x=xs, y=[fit[0] * v + fit[1] for v in xs], mode="lines",
+                    legendgroup=name, showlegend=False,
+                    line=dict(color=color, width=2, dash="dot"), hoverinfo="skip",
+                )
+            )
+    axis_unit = "조 원" if mode == AMOUNT else "전년 대비 증가율, %"
+    fig.update_xaxes(title_text=f"{ad_name} ({axis_unit})")
+    fig.update_yaxes(title_text=f"모바일 쇼핑 거래액 ({axis_unit})")
+    if mode == GROWTH:
+        fig.add_hline(y=0, line_width=1, line_dash="dot", opacity=0.4)
+        fig.add_vline(x=0, line_width=1, line_dash="dot", opacity=0.4)
+    fig.update_layout(
+        height=480, margin=dict(l=10, r=10, t=60, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    return fig, rows
+
+
+def cagr_table(shop: pd.DataFrame, categories: list[str], include_estimates: bool, year_range: tuple[int, int]) -> pd.DataFrame:
+    """상품군별 모바일 쇼핑 거래액의 연평균 증가율(%) = (끝값 ÷ 시작값)^(1/연수) − 1.
+    시작·끝 연도는 선택한 범위 안에서 값이 있는 첫 해와 마지막 해이다. 값이 2개 미만이면 NaN."""
+    rows = []
+    for category in categories:
+        df = prepare(shop[shop["category"] == category][["year", "value", "estimate"]], AMOUNT, include_estimates, year_range)
+        if len(df) < 2 or df["value"].iloc[0] <= 0:
+            rows.append({"상품군": category, "시작연도": np.nan, "끝연도": np.nan,
+                         "시작값(조 원)": np.nan, "끝값(조 원)": np.nan, "연평균 증가율(%)": np.nan})
+            continue
+        y0, y1 = int(df["year"].iloc[0]), int(df["year"].iloc[-1])
+        v0, v1 = float(df["value"].iloc[0]), float(df["value"].iloc[-1])
+        rows.append({
+            "상품군": category, "시작연도": y0, "끝연도": y1, "시작값(조 원)": v0, "끝값(조 원)": v1,
+            "연평균 증가율(%)": ((v1 / v0) ** (1 / (y1 - y0)) - 1) * 100,
+        })
+    table = pd.DataFrame(rows)
+    return table.sort_values("연평균 증가율(%)", ascending=False, na_position="last").reset_index(drop=True)
+
+
+def make_cagr_bar(table: pd.DataFrame, highlight: set[str]):
+    """품목별 연평균 증가율 가로 막대(큰 순서). 막대는 0에서 시작한다.
+    주황 = 사이드바에서 고른 상품군, 짙은 회색 = 전체(합계), 연한 파랑 = 나머지."""
+    t = table.dropna(subset=["연평균 증가율(%)"])
+    colors = [
+        SHOP_COLORS[0] if name in highlight else ("#374151" if name == ALL_LABEL else "#9fb0c8")
+        for name in t["상품군"]
+    ]
+    fig = go.Figure(
+        go.Bar(
+            x=t["연평균 증가율(%)"], y=t["상품군"], orientation="h", marker=dict(color=colors),
+            text=[f"{v:.1f}%" for v in t["연평균 증가율(%)"]], textposition="outside", cliponaxis=False,
+            customdata=t[["시작연도", "끝연도"]].to_numpy(),
+            hovertemplate="%{y}<br>연평균 %{x:.1f}% (%{customdata[0]}~%{customdata[1]}년)<extra></extra>",
+        )
+    )
+    fig.update_yaxes(autorange="reversed")
+    fig.update_xaxes(title_text="연평균 증가율 (%)", rangemode="tozero")
+    fig.update_layout(height=max(260, 70 + 26 * len(t)), margin=dict(l=10, r=50, t=10, b=10), showlegend=False)
+    return fig
+
+
+def growth_summary(series: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """계열별 전년 대비 증가율의 흩어진 정도와 극값 표: 평균, 표준편차, 최고·최저(연도), 범위(최고−최저)."""
+    rows = []
+    for name, df in series.items():
+        if df.empty:
+            continue
+        values = df["value"].reset_index(drop=True)
+        years = df["year"].reset_index(drop=True)
+        rows.append({
+            "계열": name,
+            "연도 수": len(values),
+            "평균(%)": float(values.mean()),
+            "표준편차(%p)": float(values.std(ddof=1)) if len(values) > 1 else float("nan"),
+            "최고(%)": float(values.max()),
+            "최고 연도": int(years[values.idxmax()]),
+            "최저(%)": float(values.min()),
+            "최저 연도": int(years[values.idxmin()]),
+            "범위(%p)": float(values.max() - values.min()),
+        })
+    return pd.DataFrame(rows)
+
+
+def make_growth_box(entries: list[tuple[str, pd.DataFrame, str]]):
+    """계열별 전년 대비 증가율의 상자그림. 연도마다의 점도 모두 찍어 최고·최저 연도를 바로 볼 수 있다.
+    (점선 = 평균) entries: [(이름, 증가율 표, 색)]"""
+    fig = go.Figure()
+    for name, df, color in entries:
+        fig.add_trace(
+            go.Box(
+                y=df["value"], name=name, boxpoints="all", pointpos=0, boxmean=True,
+                text=df["year"].astype(str), marker=dict(color=color, size=8), line=dict(color=color),
+                hovertemplate=f"<b>{name}</b><br>%{{text}}년 · %{{y:.1f}}%<extra></extra>",
+            )
+        )
+    fig.add_hline(y=0, line_width=1, line_dash="dot", opacity=0.4)
+    fig.update_yaxes(title_text="전년 대비 증가율 (%)")
+    fig.update_layout(height=440, margin=dict(l=10, r=10, t=10, b=10), showlegend=False)
+    return fig
 
 
 def correlation_matrix(ad_tables, shop, categories, include_estimates, year_range):
