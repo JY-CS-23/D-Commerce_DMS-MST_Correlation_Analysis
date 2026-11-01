@@ -190,4 +190,3 @@ def main():
                    ", ".join(f"{y}년({m}개월)" for y, m in skipped_years.items()))
     if include_estimates:
         st.caption("점선과 속이 빈 점은 추정치 또는 잠정치입니다.")
-    
