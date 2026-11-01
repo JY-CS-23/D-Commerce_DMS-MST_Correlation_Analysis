@@ -1,4 +1,4 @@
-    return pd.DataFrame({"year": list(years), "value": growth.to_numpy(), "estimate": est.to_numpy()}).dropna(subset=["value"]).reset_index(drop=True)
+return pd.DataFrame({"year": list(years), "value": growth.to_numpy(), "estimate": est.to_numpy()}).dropna(subset=["value"]).reset_index(drop=True)
 
 
 def prepare(df: pd.DataFrame, mode: str, include_estimates: bool, year_range: tuple[int, int]) -> pd.DataFrame:
